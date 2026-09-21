@@ -189,8 +189,13 @@ object Sessions {
     fun of(account: Account): SftpSession =
         sessions.computeIfAbsent(account.id) { SftpSession(account) }
 
+    /**
+     * Disconnecting writes to the socket, so it cannot happen on the main thread —
+     * and this is reached from the UI when a server is removed.
+     */
     fun close(accountId: String) {
-        sessions.remove(accountId)?.close()
+        val session = sessions.remove(accountId) ?: return
+        Thread({ session.close() }, "sftp-disconnect").start()
     }
 
     fun closeAll() {
