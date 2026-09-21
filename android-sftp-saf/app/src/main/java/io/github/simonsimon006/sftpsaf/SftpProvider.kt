@@ -205,10 +205,11 @@ class SftpProvider : DocumentsProvider() {
         val readable = flags and ParcelFileDescriptor.MODE_READ_ONLY != 0
         val writable = flags and ParcelFileDescriptor.MODE_WRITE_ONLY != 0
         val append = flags and ParcelFileDescriptor.MODE_APPEND != 0
+        val truncate = flags and ParcelFileDescriptor.MODE_TRUNCATE != 0
         return if (writable && !readable) {
-            openStreamingWrite(documentId, append, signal)
+            openStreamingWrite(documentId, append, truncate, signal)
         } else {
-            openRandomAccess(documentId, writable)
+            openRandomAccess(documentId, writable, truncate)
         }
     }
 
@@ -223,6 +224,7 @@ class SftpProvider : DocumentsProvider() {
     private fun openStreamingWrite(
         documentId: String,
         append: Boolean,
+        truncate: Boolean,
         signal: CancellationSignal?,
     ): ParcelFileDescriptor {
         val path = pathOf(documentId)
@@ -246,7 +248,7 @@ class SftpProvider : DocumentsProvider() {
         Thread({
             var failure: String? = null
             try {
-                upload(session.connected(), readSide, path, append)
+                upload(session.connected(), readSide, path, append, truncate)
             } catch (t: Throwable) {
                 failure = t.message ?: t.javaClass.simpleName
                 Log.e(TAG, "upload to $path failed", t)
@@ -271,9 +273,10 @@ class SftpProvider : DocumentsProvider() {
         readSide: ParcelFileDescriptor,
         path: String,
         append: Boolean,
+        truncate: Boolean,
     ) {
-        val modes = if (append) EnumSet.of(OpenMode.WRITE, OpenMode.CREAT)
-        else EnumSet.of(OpenMode.WRITE, OpenMode.CREAT, OpenMode.TRUNC)
+        val modes = EnumSet.of(OpenMode.WRITE, OpenMode.CREAT)
+        if (truncate && !append) modes.add(OpenMode.TRUNC)
         sftp.open(path, modes).use { file ->
             val offset = if (append) file.length() else 0L
             val chunk = (sftp.sftpEngine.subsystem.remoteMaxPacketSize - file.outgoingPacketOverhead)
@@ -296,10 +299,20 @@ class SftpProvider : DocumentsProvider() {
      * seek. Sequential access still streams with read-ahead; only an actual seek
      * pays for a new request chain.
      */
-    private fun openRandomAccess(documentId: String, writable: Boolean): ParcelFileDescriptor {
+    private fun openRandomAccess(
+        documentId: String,
+        writable: Boolean,
+        truncate: Boolean,
+    ): ParcelFileDescriptor {
         val path = pathOf(documentId)
-        val modes = if (writable) EnumSet.of(OpenMode.READ, OpenMode.WRITE, OpenMode.CREAT)
-        else EnumSet.of(OpenMode.READ)
+        val modes = EnumSet.of(OpenMode.READ)
+        if (writable) {
+            modes.add(OpenMode.WRITE)
+            modes.add(OpenMode.CREAT)
+            // "rwt" asks for the old contents to go away; without this the tail of
+            // a longer previous file would survive underneath the new one.
+            if (truncate) modes.add(OpenMode.TRUNC)
+        }
         val file = onSftp(documentId) { it.open(path, modes) }
 
         val worker = HandlerThread("sftp-fd")
