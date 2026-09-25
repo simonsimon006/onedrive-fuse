@@ -12,8 +12,11 @@
         android:label="@string/app_name"
         android:theme="@style/AppTheme">
 
+        <!-- configChanges: rotating mid-connect must not rebuild the screen and drop
+             the picked key or the pending result. -->
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
             android:exported="true"
             android:label="@string/app_name">
             <intent-filter>

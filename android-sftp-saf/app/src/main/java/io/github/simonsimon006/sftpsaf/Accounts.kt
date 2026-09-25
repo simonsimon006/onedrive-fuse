@@ -50,7 +50,7 @@ data class Account(
             password = o.optNullableString("password"),
             keyFile = o.optNullableString("keyFile"),
             keyPassphrase = o.optNullableString("keyPassphrase"),
-            root = o.getString("root"),
+            root = normalizeRoot(o.getString("root")),
             hostKey = o.getString("hostKey"),
         )
     }
@@ -58,6 +58,15 @@ data class Account(
 
 private fun JSONObject.optNullableString(name: String): String? =
     if (isNull(name)) null else getString(name)
+
+/**
+ * New servers store the server's own canonical path, but ones added by the
+ * first build may carry a trailing slash. Child ids are derived from the root,
+ * so "/srv/b/" and "/srv/b" would name the same folder twice and change
+ * notifications for it would go to the wrong id.
+ */
+internal fun normalizeRoot(root: String): String =
+    if (root.length > 1) root.trimEnd('/').ifEmpty { "/" } else root.ifEmpty { "." }
 
 /**
  * Accounts live in app-private SharedPreferences. That is the app sandbox plus

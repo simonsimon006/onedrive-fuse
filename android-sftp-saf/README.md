@@ -23,32 +23,34 @@ make the app bigger rather than smaller:
 * An SSH library in the JVM half costs one jar and keeps the whole app one language.
 
 So: Kotlin, no AndroidX, no Compose, no dependency injection, no database. Four source
-files, just under 1000 lines, plus [sshj](https://github.com/hierynomus/sshj) and
+files, about 1100 lines, plus [sshj](https://github.com/hierynomus/sshj) and
 BouncyCastle for the protocol.
 
 ## How the big-file path works
 
-`openDocument` has two modes, picked from the flags the client asks for.
+Every open — reads, writes and backups alike — is served through
+`StorageManager.openProxyFileDescriptor`: the app gets a real file descriptor, and its
+reads and writes arrive in the provider as calls it answers over SFTP.
 
-**Write-only (`"w"`) — what a backup does.** The provider returns one end of a
-`ParcelFileDescriptor.createReliablePipe()` and drains the other end straight into an
-SFTP write stream on a worker thread:
-
-* Nothing is staged in a temp file, so the file size is bounded by the remote
-  filesystem, not by free space on the phone.
-* Memory stays flat — one chunk sized to the server's maximum SFTP packet, plus up to
-  32 write requests in flight so throughput isn't one round-trip per chunk.
-* The pipe gives backpressure for free: when the network is the bottleneck the writing
-  app blocks on `write()` instead of buffering.
-* If the transfer fails the read end is closed *with an error*, which fails the client's
-  `write`/`close` rather than letting it believe a truncated upload succeeded.
+* **Nothing is staged locally.** Bytes go straight from the writing app into the SFTP
+  stream, so file size is bounded by the remote filesystem, not by space on the phone,
+  and memory stays flat.
+* **Writes are pipelined.** Up to 32 write requests (~1 MiB) are in flight at once, so
+  throughput isn't one network round-trip per chunk. Small writes from the app are
+  coalesced into full packets.
+* **Failures reach the app.** A failed write surfaces as `EIO` on a later `write()`, and
+  at the latest on `fsync()`, which waits for every outstanding write to be acknowledged.
+  After one failure every later write and `fsync` on that descriptor fails too, so an
+  upload that lost data can never be reported as complete.
+* **Seeking works**, for reads and writes. Sequential reads stream with read-ahead; a
+  seek just starts a new read-ahead window.
 * A partial wake lock is held while bytes are moving, so a multi-hour upload survives the
-  screen going off.
+  screen going off. It lapses a minute after the last read or write, so a descriptor an
+  app forgets to close cannot keep the phone awake.
 
-**Read or read/write.** These go through `StorageManager.openProxyFileDescriptor`, so
-clients can seek. Sequential reads reuse one read-ahead stream; only an actual seek pays
-for a new request chain. This path is slower than the pipe — it crosses a FUSE mount per
-operation — which is why write-only opens are kept separate.
+An earlier version streamed write-only opens through a pipe instead. Pipes can't be
+fsync'd, so a failure in the last megabyte of an upload could never reach the app — the
+reason for the switch.
 
 ## Build
 
@@ -67,8 +69,9 @@ risk for roughly half the APK size.
 
 ## Use
 
-1. Open the app, fill in host, user, the remote directory to expose, and either a
-   password or a private key file.
+1. Open the app, fill in host, user, the remote folder to expose (empty means your
+   home folder; `~/backups` and relative paths work too), and either a password or a
+   private key file.
 2. "Connect and add" dials the server and shows its host key fingerprint. Check it
    against `ssh-keyscan -p 22 your.host | ssh-keygen -lf -` run somewhere you trust,
    then confirm. The key is pinned; if it ever changes, connections fail instead of
@@ -77,21 +80,25 @@ risk for roughly half the APK size.
    "Save to..." / "Open from..." picker.
 
 Supported: browse, create, rename, move (within one server), delete (recursive),
-read, write. Password and public-key auth (RSA, ECDSA, ed25519; OpenSSH and PEM key
-files, with or without a passphrase).
+read, write, seek. Password auth (including servers that only offer
+keyboard-interactive, like FreeBSD and TrueNAS CORE) and public-key auth (RSA, ECDSA,
+ed25519; OpenSSH and PEM key files, with or without a passphrase). The exposed folder
+itself can't be deleted, renamed or moved from a file manager.
 
 ## Things worth knowing
 
 * **Credentials** are stored in app-private `SharedPreferences`, and a chosen key file is
   copied into app-private storage. That's the app sandbox plus whatever file-based
   encryption the device does — not a hardened keystore.
-* **A completed `close()` isn't a completed upload.** A pipe write returns as soon as the
-  bytes are in the pipe, so the last chunk may still be in flight when the writing app
-  thinks it's done. Errors surface as a failed `write`/`close` when the client is still
-  writing, but an app that closes early and immediately checks the file size may see a
-  short read. This is inherent to streaming through SAF, not specific to this provider.
-* **No random-access writes on the fast path.** A `"w"` open is a forward-only stream.
-  Apps that seek while writing get the slower proxy-descriptor path instead.
+* **`close()` can't report errors — `fsync()` can.** Android's proxy descriptors have no
+  flush hook, so if the last ~1 MiB of writes fails *after* an app closes without
+  fsyncing, the app can't be told (same as NFS). Apps that fsync before closing get
+  every error. Some cloud-backed SFTP gateways only commit on close; their failures
+  can't be surfaced either.
+* **`"w"` truncates.** Since Android 10 plain `"w"` doesn't formally ask for truncation
+  (only `"wt"` does), but a write-only open can only be a rewrite, and keeping the old
+  tail would corrupt a shorter replacement backup. `"rw"` keeps existing content;
+  `"rwt"` truncates.
 * **One connection per server**, shared by all operations and reconnected on demand.
   Browsing while a large upload runs is fine; it just shares the link.
 * **Moves between two configured servers** are refused — copy instead.

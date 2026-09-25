@@ -53,10 +53,9 @@
             android:id="@+id/root"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:hint="Remote directory (e.g. /srv/backups)"
+            android:hint="Remote folder (empty = home folder)"
             android:importantForAutofill="no"
-            android:inputType="textUri"
-            android:text="/" />
+            android:inputType="textUri" />
 
         <RadioGroup
             android:id="@+id/auth"

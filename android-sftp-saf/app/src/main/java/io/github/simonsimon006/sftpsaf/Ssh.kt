@@ -110,9 +110,11 @@ fun connect(account: Account, verifier: HostKeyVerifier): SSHClient {
     val client = SSHClient(config)
     client.connectTimeout = CONNECT_TIMEOUT_MS
     client.addHostKeyVerifier(verifier)
+    // sshj starts the keep-alive thread inside connect(), and only if the
+    // interval is already set; setting it afterwards silently does nothing.
+    client.connection.keepAlive.keepAliveInterval = KEEP_ALIVE_SECONDS
     try {
         client.connect(account.host, account.port)
-        client.connection.keepAlive.keepAliveInterval = KEEP_ALIVE_SECONDS
         if (account.keyFile != null) {
             val keys = if (account.keyPassphrase.isNullOrEmpty()) {
                 client.loadKeys(account.keyFile)
@@ -121,6 +123,8 @@ fun connect(account: Account, verifier: HostKeyVerifier): SSHClient {
             }
             client.authPublickey(account.user, keys)
         } else {
+            // Also answers keyboard-interactive password prompts, which is all some
+            // servers (FreeBSD, TrueNAS CORE) accept.
             client.authPassword(account.user, account.password ?: "")
         }
     } catch (e: Throwable) {
@@ -136,7 +140,12 @@ fun connect(account: Account, verifier: HostKeyVerifier): SSHClient {
  * runs is fine.
  */
 class SftpSession(private val account: Account) {
+    // Written under the lock, but alive() reads them from whichever thread's
+    // request just failed.
+    @Volatile
     private var ssh: SSHClient? = null
+
+    @Volatile
     private var sftp: SFTPClient? = null
 
     private fun alive(): Boolean {

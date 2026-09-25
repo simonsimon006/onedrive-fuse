@@ -1,5 +1,6 @@
 package io.github.simonsimon006.sftpsaf
 
+import android.content.Context
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.os.CancellationSignal
@@ -8,6 +9,7 @@ import android.os.HandlerThread
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.ProxyFileDescriptorCallback
+import android.os.SystemClock
 import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
@@ -24,10 +26,11 @@ import net.schmizz.sshj.sftp.RemoteFile
 import net.schmizz.sshj.sftp.Response
 import net.schmizz.sshj.sftp.SFTPClient
 import net.schmizz.sshj.sftp.SFTPException
-import java.io.FileInputStream
+import java.io.BufferedOutputStream
 import java.io.FileNotFoundException
 import java.io.IOException
 import java.io.InputStream
+import java.io.OutputStream
 import java.util.EnumSet
 
 private val DEFAULT_ROOT_PROJECTION = arrayOf(
@@ -95,8 +98,8 @@ class SftpProvider : DocumentsProvider() {
         val account = account(documentId)
         val path = pathOf(documentId)
         val attributes = onSftp(documentId) { it.stat(path) }
-        val name = if (path == account.root) account.label else nameOf(path)
-        addDocumentRow(cursor, documentId, name, attributes)
+        val isRoot = isRoot(documentId)
+        addDocumentRow(cursor, documentId, if (isRoot) account.label else nameOf(path), attributes, isRoot)
         return cursor
     }
 
@@ -118,7 +121,7 @@ class SftpProvider : DocumentsProvider() {
                     // are browsable. A dangling link just stays a link.
                     attributes = runCatching { sftp.stat(childPath) }.getOrDefault(attributes)
                 }
-                addDocumentRow(cursor, docId(accountId, childPath), entry.name, attributes)
+                addDocumentRow(cursor, docId(accountId, childPath), entry.name, attributes, isRoot = false)
             }
         }
         cursor.setNotificationUri(
@@ -155,6 +158,7 @@ class SftpProvider : DocumentsProvider() {
     }
 
     override fun deleteDocument(documentId: String) {
+        requireNotRoot(documentId)
         val path = pathOf(documentId)
         onSftp(documentId) { removeRecursively(it, path) }
         notifyChildrenChanged(docId(accountIdOf(documentId), parentOf(path)))
@@ -165,6 +169,7 @@ class SftpProvider : DocumentsProvider() {
     }
 
     override fun renameDocument(documentId: String, displayName: String): String {
+        requireNotRoot(documentId)
         val path = pathOf(documentId)
         val parent = parentOf(path)
         if (displayName == nameOf(path)) return documentId
@@ -185,6 +190,7 @@ class SftpProvider : DocumentsProvider() {
         check(accountIdOf(sourceDocumentId) == accountIdOf(targetParentDocumentId)) {
             "Moving between two different servers is not supported; copy the file instead."
         }
+        requireNotRoot(sourceDocumentId)
         val from = pathOf(sourceDocumentId)
         val moved = onSftp(sourceDocumentId) { sftp ->
             val target = freePath(sftp, pathOf(targetParentDocumentId), nameOf(from))
@@ -196,6 +202,13 @@ class SftpProvider : DocumentsProvider() {
         return docId(accountIdOf(sourceDocumentId), moved)
     }
 
+    /**
+     * Every open — including a write-only backup stream — is served as a proxy
+     * descriptor, not a pipe. A pipe cannot be fsync'd, so an upload failure in
+     * its last in-flight window could never reach the app; through the proxy the
+     * app's fsync() waits for every write to be acknowledged and fails if one
+     * was not. Writes are still pipelined, so this costs no throughput.
+     */
     override fun openDocument(
         documentId: String,
         mode: String,
@@ -204,143 +217,38 @@ class SftpProvider : DocumentsProvider() {
         val flags = ParcelFileDescriptor.parseMode(mode)
         val readable = flags and ParcelFileDescriptor.MODE_READ_ONLY != 0
         val writable = flags and ParcelFileDescriptor.MODE_WRITE_ONLY != 0
-        val append = flags and ParcelFileDescriptor.MODE_APPEND != 0
-        val truncate = flags and ParcelFileDescriptor.MODE_TRUNCATE != 0
-        return if (writable && !readable) {
-            openStreamingWrite(documentId, append, truncate, signal)
-        } else {
-            openRandomAccess(documentId, writable, truncate)
-        }
-    }
-
-    /**
-     * Write-only opens — which is what a backup writing one enormous file does —
-     * are served by a pipe drained straight into the SFTP channel. Nothing is
-     * staged on local storage and memory stays flat, so file size is bounded
-     * only by the remote filesystem. The cost is that the stream is one-way:
-     * the client cannot seek, which is why read/write opens take the slower
-     * random-access path below.
-     */
-    private fun openStreamingWrite(
-        documentId: String,
-        append: Boolean,
-        truncate: Boolean,
-        signal: CancellationSignal?,
-    ): ParcelFileDescriptor {
         val path = pathOf(documentId)
-        val session = Sessions.of(account(documentId))
-        val pipe = try {
-            ParcelFileDescriptor.createReliablePipe()
-        } catch (e: IOException) {
-            throw IllegalStateException("cannot open pipe for $path", e)
-        }
-        val readSide = pipe[0]
-        val writeSide = pipe[1]
-
-        signal?.setOnCancelListener {
-            runCatching { readSide.closeWithError("cancelled") }
-        }
-
-        val wakeLock = context!!.getSystemService(PowerManager::class.java)
-            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$TAG:upload")
-        wakeLock.acquire()
-
-        Thread({
-            var failure: String? = null
-            try {
-                upload(session.connected(), readSide, path, append, truncate)
-            } catch (t: Throwable) {
-                failure = t.message ?: t.javaClass.simpleName
-                Log.e(TAG, "upload to $path failed", t)
-            } finally {
-                // A reliable pipe lets us fail the client's write/close instead of
-                // letting it believe a half-finished upload succeeded.
-                runCatching {
-                    if (failure != null) readSide.closeWithError(failure) else readSide.close()
-                }
-                runCatching { wakeLock.release() }
-                runCatching {
-                    notifyChildrenChanged(docId(accountIdOf(documentId), parentOf(path)))
-                }
-            }
-        }, "sftp-upload").start()
-
-        return writeSide
-    }
-
-    private fun upload(
-        sftp: SFTPClient,
-        readSide: ParcelFileDescriptor,
-        path: String,
-        append: Boolean,
-        truncate: Boolean,
-    ) {
-        val modes = EnumSet.of(OpenMode.WRITE, OpenMode.CREAT)
-        if (truncate && !append) modes.add(OpenMode.TRUNC)
-        sftp.open(path, modes).use { file ->
-            val offset = if (append) file.length() else 0L
-            val chunk = (sftp.sftpEngine.subsystem.remoteMaxPacketSize - file.outgoingPacketOverhead)
-                .coerceIn(1024, 64 * 1024)
-            // readSide owns the descriptor, so this stream is deliberately not closed.
-            val source = FileInputStream(readSide.fileDescriptor)
-            file.RemoteFileOutputStream(offset, MAX_UNCONFIRMED_WRITES).use { sink ->
-                val buffer = ByteArray(chunk)
-                while (true) {
-                    val read = source.read(buffer)
-                    if (read < 0) break
-                    sink.write(buffer, 0, read)
-                }
-            }
-        }
-    }
-
-    /**
-     * Reads (and read/write opens) go through a proxy descriptor so clients can
-     * seek. Sequential access still streams with read-ahead; only an actual seek
-     * pays for a new request chain.
-     */
-    private fun openRandomAccess(
-        documentId: String,
-        writable: Boolean,
-        truncate: Boolean,
-    ): ParcelFileDescriptor {
-        val path = pathOf(documentId)
-        val modes = EnumSet.of(OpenMode.READ)
-        if (writable) {
-            modes.add(OpenMode.WRITE)
-            modes.add(OpenMode.CREAT)
-            // "rwt" asks for the old contents to go away; without this the tail of
-            // a longer previous file would survive underneath the new one.
-            if (truncate) modes.add(OpenMode.TRUNC)
-        }
-        val file = onSftp(documentId) { it.open(path, modes) }
+        val opened = onSftp(documentId) { openRemote(it, path, flags) }
 
         val worker = HandlerThread("sftp-fd")
         worker.start()
-        val wakeLock = context!!.getSystemService(PowerManager::class.java)
-            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$TAG:transfer")
-        wakeLock.acquire()
-
-        val callback = SftpFileCallback(file) {
-            runCatching { worker.quitSafely() }
-            runCatching { wakeLock.release() }
-            if (writable) {
-                runCatching {
-                    notifyChildrenChanged(docId(accountIdOf(documentId), parentOf(path)))
-                }
+        val wakeLock = TransferWakeLock(context!!)
+        val callback = SftpFileCallback(
+            opened.file,
+            opened.chunk,
+            opened.base,
+            opened.visibleLength,
+            wakeLock::renew,
+        ) { wrote ->
+            wakeLock.release()
+            worker.quitSafely()
+            if (wrote) {
+                runCatching { notifyChildrenChanged(docId(accountIdOf(documentId), parentOf(path))) }
             }
         }
+        val access = when {
+            readable && writable -> ParcelFileDescriptor.MODE_READ_WRITE
+            writable -> ParcelFileDescriptor.MODE_WRITE_ONLY
+            else -> ParcelFileDescriptor.MODE_READ_ONLY
+        }
         return try {
-            context!!.getSystemService(StorageManager::class.java).openProxyFileDescriptor(
-                if (writable) ParcelFileDescriptor.MODE_READ_WRITE else ParcelFileDescriptor.MODE_READ_ONLY,
-                callback,
-                Handler(worker.looper),
-            )
-        } catch (e: IOException) {
+            context!!.getSystemService(StorageManager::class.java)
+                .openProxyFileDescriptor(access, callback, Handler(worker.looper))
+        } catch (e: Exception) {
             worker.quitSafely()
             wakeLock.release()
-            runCatching { file.close() }
-            throw IllegalStateException("cannot open $path", e)
+            runCatching { opened.file.close() }
+            throw if (e is IOException) IllegalStateException("cannot open $path", e) else e
         }
     }
 
@@ -349,13 +257,15 @@ class SftpProvider : DocumentsProvider() {
         documentId: String,
         name: String,
         attributes: FileAttributes,
+        isRoot: Boolean,
     ) {
         val isDirectory = attributes.type == FileMode.Type.DIRECTORY
-        var flags = Document.FLAG_SUPPORTS_DELETE or
-            Document.FLAG_SUPPORTS_RENAME or
-            Document.FLAG_SUPPORTS_MOVE
-        flags = flags or if (isDirectory) Document.FLAG_DIR_SUPPORTS_CREATE
-        else Document.FLAG_SUPPORTS_WRITE
+        var flags = if (isDirectory) Document.FLAG_DIR_SUPPORTS_CREATE else Document.FLAG_SUPPORTS_WRITE
+        if (!isRoot) {
+            flags = flags or Document.FLAG_SUPPORTS_DELETE or
+                Document.FLAG_SUPPORTS_RENAME or
+                Document.FLAG_SUPPORTS_MOVE
+        }
         cursor.newRow().apply {
             add(Document.COLUMN_DOCUMENT_ID, documentId)
             add(Document.COLUMN_DISPLAY_NAME, name)
@@ -363,7 +273,8 @@ class SftpProvider : DocumentsProvider() {
                 Document.COLUMN_MIME_TYPE,
                 if (isDirectory) Document.MIME_TYPE_DIR else mimeTypeOf(name),
             )
-            add(Document.COLUMN_SIZE, attributes.size)
+            // A directory's own size is filesystem bookkeeping, not something to show.
+            add(Document.COLUMN_SIZE, if (isDirectory) null else attributes.size)
             add(Document.COLUMN_LAST_MODIFIED, attributes.mtime * 1000L)
             add(Document.COLUMN_FLAGS, flags)
         }
@@ -403,6 +314,22 @@ class SftpProvider : DocumentsProvider() {
         return joinPath(dir, candidate)
     }
 
+    /**
+     * The root is the folder the whole location hangs off. Deleting or moving it
+     * through a tree grant would wipe or orphan everything below, so the flags
+     * never offer it and this refuses it for clients that ignore the flags.
+     */
+    private fun requireNotRoot(documentId: String) {
+        check(!isRoot(documentId)) {
+            "The server's root folder cannot be deleted, renamed or moved from here."
+        }
+    }
+
+    // Normalised, because a tree grant made with the first build can still carry
+    // the root spelled with a trailing slash.
+    private fun isRoot(documentId: String): Boolean =
+        normalizeRoot(pathOf(documentId)) == account(documentId).root
+
     private fun account(documentId: String): Account =
         Accounts.byId(context!!, accountIdOf(documentId))
             ?: throw FileNotFoundException("no server configured for $documentId")
@@ -432,28 +359,101 @@ class SftpProvider : DocumentsProvider() {
     }
 }
 
+internal class OpenedFile(
+    val file: RemoteFile,
+    /** Largest payload for one SFTP write. */
+    val chunk: Int,
+    /** Remote offset of the descriptor's offset 0. */
+    val base: Long,
+    /** Length the descriptor reports to begin with. */
+    val visibleLength: Long,
+)
+
 /**
- * Serves a proxy descriptor from an open remote file. Sequential reads reuse one
- * read-ahead stream; a seek throws it away and starts a new one at the new offset.
+ * Opens [path] for a SAF mode. The proxy descriptor only carries the access mode
+ * (the system masks off O_APPEND and O_TRUNC before AppFuse sees them), so both
+ * are done here: truncation by the SFTP open, and appending by showing the
+ * descriptor an empty file whose offset 0 sits at the current end.
  */
-private class SftpFileCallback(
+internal fun openRemote(sftp: SFTPClient, path: String, flags: Int): OpenedFile {
+    val readable = flags and ParcelFileDescriptor.MODE_READ_ONLY != 0
+    val writable = flags and ParcelFileDescriptor.MODE_WRITE_ONLY != 0
+    val append = writable && flags and ParcelFileDescriptor.MODE_APPEND != 0
+    // Since Android 10 plain "w" no longer carries MODE_TRUNCATE, only "wt" does.
+    // A write-only descriptor cannot read, so it can only be rewriting the file;
+    // keeping the old tail would leave a shorter new backup with the previous
+    // one's end still attached — for a zip, the old central directory. So "w"
+    // truncates as it used to, and only "rw" needs the explicit "t".
+    val truncate = writable && !append &&
+        (!readable || flags and ParcelFileDescriptor.MODE_TRUNCATE != 0)
+
+    val modes = EnumSet.noneOf(OpenMode::class.java)
+    if (readable) modes.add(OpenMode.READ)
+    if (writable) {
+        modes.add(OpenMode.WRITE)
+        modes.add(OpenMode.CREAT)
+        if (truncate) modes.add(OpenMode.TRUNC)
+    }
+    val file = sftp.open(path, modes)
+    try {
+        val length = if (truncate) 0L else file.length()
+        // Largest payload that fits one SSH packet, and never above the 32 KiB
+        // every SFTP server has to accept.
+        val chunk = (sftp.sftpEngine.subsystem.remoteMaxPacketSize - file.outgoingPacketOverhead)
+            .coerceIn(1024, 32 * 1024)
+        return OpenedFile(file, chunk, if (append) length else 0L, if (append) 0L else length)
+    } catch (e: IOException) {
+        runCatching { file.close() }
+        throw e
+    }
+}
+
+/**
+ * Serves one proxy descriptor from an open remote file. Every call arrives on the
+ * descriptor's own handler thread, so none of this state needs locking.
+ *
+ * Writes are pipelined: up to [MAX_UNCONFIRMED_WRITES] chunks are in flight, so a
+ * failure usually surfaces on a later write() rather than the one that caused it,
+ * and at the latest on fsync(), which waits for every outstanding reply. Only
+ * close() cannot report anything — AppFuse has no flush hook — so an app that
+ * closes without fsync can miss an error in its last ~1 MB, as it would on NFS.
+ *
+ * Sequential reads stream through one read-ahead window; a seek, or any write,
+ * drops it and the next read starts a new one.
+ */
+internal class SftpFileCallback(
     private val file: RemoteFile,
-    private val onClosed: () -> Unit,
+    private val chunk: Int,
+    /** Remote offset of this descriptor's offset 0; non-zero only when appending. */
+    private val base: Long,
+    /** File length as this descriptor sees it, kept current by our own writes. */
+    private var length: Long,
+    /** Called before each read, write or fsync — keeps the wake lock alive. */
+    private val onActivity: () -> Unit,
+    private val onClosed: (wrote: Boolean) -> Unit,
 ) : ProxyFileDescriptorCallback() {
 
-    private var stream: InputStream? = null
-    private var streamOffset = -1L
+    private var reader: InputStream? = null
+    private var readerOffset = -1L
+    private var writer: OutputStream? = null
+    private var writerOffset = -1L
+    private var writeFailure: IOException? = null
+    private var wrote = false
 
-    override fun onGetSize(): Long = guarded { file.length() }
+    // Answered from memory: the kernel asks on every getattr, and a round trip
+    // each time would stall the write pipeline.
+    override fun onGetSize(): Long = length
 
-    override fun onRead(offset: Long, size: Int, data: ByteArray): Int = guarded {
-        val current = stream
-        val source = if (current != null && streamOffset == offset) {
+    override fun onRead(offset: Long, size: Int, data: ByteArray): Int = io {
+        // A read must see what this descriptor already wrote.
+        if (writer != null) writing { flushWriter() }
+        val current = reader
+        val source = if (current != null && readerOffset == offset) {
             current
         } else {
-            runCatching { current?.close() }
-            streamOffset = offset
-            file.ReadAheadRemoteFileInputStream(MAX_UNCONFIRMED_READS, offset).also { stream = it }
+            readerOffset = offset
+            file.ReadAheadRemoteFileInputStream(MAX_UNCONFIRMED_READS, base + offset)
+                .also { reader = it }
         }
         var got = 0
         while (got < size) {
@@ -461,34 +461,112 @@ private class SftpFileCallback(
             if (read < 0) break
             got += read
         }
-        streamOffset += got
+        readerOffset += got
         got
     }
 
-    override fun onWrite(offset: Long, size: Int, data: ByteArray): Int = guarded {
-        dropStream()
-        file.write(offset, data, 0, size)
+    override fun onWrite(offset: Long, size: Int, data: ByteArray): Int = io {
+        writing {
+            reader = null
+            val sink = writer?.takeIf { writerOffset == offset } ?: run {
+                flushWriter()
+                // Buffered so a client writing in small pieces still fills whole packets.
+                BufferedOutputStream(file.RemoteFileOutputStream(base + offset, MAX_UNCONFIRMED_WRITES), chunk)
+                    .also {
+                        writer = it
+                        writerOffset = offset
+                    }
+            }
+            // AppFuse hands over up to 128 KiB at once; no single SFTP write may exceed a chunk.
+            var done = 0
+            while (done < size) {
+                val piece = minOf(chunk, size - done)
+                sink.write(data, done, piece)
+                done += piece
+            }
+            writerOffset += size
+            length = maxOf(length, offset + size)
+            wrote = true
+        }
         size
     }
 
-    override fun onFsync() = Unit
+    override fun onFsync() = io { writing { flushWriter() } }
 
     override fun onRelease() {
-        dropStream()
+        if (writer != null) {
+            runCatching { writing { flushWriter() } }.onFailure {
+                Log.e(TAG, "write failed after the client closed; it could not be told", it)
+            }
+        }
+        reader = null
         runCatching { file.close() }
-        onClosed()
+        onClosed(wrote)
     }
 
-    private fun dropStream() {
-        runCatching { stream?.close() }
-        stream = null
-        streamOffset = -1L
+    /**
+     * Runs a step of the write pipeline. The first failure is sticky: the failed
+     * reply has been consumed by the time it is reported, so without this a later
+     * fsync would find nothing outstanding and report success for a file that is
+     * missing data.
+     */
+    private inline fun <T> writing(block: () -> T): T {
+        writeFailure?.let { throw IOException("an earlier write to this file failed", it) }
+        try {
+            return block()
+        } catch (e: Exception) {
+            val failure = e as? IOException ?: IOException(e)
+            writeFailure = failure
+            writer = null
+            writerOffset = -1L
+            throw failure
+        }
     }
 
-    private inline fun <T> guarded(block: () -> T): T = try {
-        block()
-    } catch (e: IOException) {
-        Log.e(TAG, "remote file operation failed", e)
-        throw ErrnoException("sftp", OsConstants.EIO, e)
+    /** Pushes buffered bytes out and waits until the server has acknowledged all of them. */
+    private fun flushWriter() {
+        val sink = writer ?: return
+        writer = null
+        writerOffset = -1L
+        sink.flush()
+    }
+
+    private inline fun <T> io(block: () -> T): T {
+        onActivity()
+        return try {
+            block()
+        } catch (e: IOException) {
+            Log.e(TAG, "remote file operation failed", e)
+            throw ErrnoException("sftp", OsConstants.EIO, e)
+        }
     }
 }
+
+/**
+ * Keeps the CPU awake while a descriptor is moving bytes, so a multi-hour backup
+ * survives the screen going off, but lets go within a minute of the last read or
+ * write. An app that leaves a descriptor open and idle therefore does not hold
+ * the device awake, and a descriptor that is never closed cannot leak the lock.
+ */
+private class TransferWakeLock(context: Context) {
+    private val lock = context.getSystemService(PowerManager::class.java)
+        .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$TAG:transfer")
+        .apply { setReferenceCounted(false) }
+    private var renewedAt = 0L
+
+    fun renew() {
+        val now = SystemClock.elapsedRealtime()
+        // Renewing is a binder call; once every few seconds is plenty.
+        if (!lock.isHeld || now - renewedAt >= WAKE_LOCK_RENEW_MS) {
+            lock.acquire(WAKE_LOCK_HOLD_MS)
+            renewedAt = now
+        }
+    }
+
+    fun release() {
+        runCatching { lock.release() }
+    }
+}
+
+private const val WAKE_LOCK_HOLD_MS = 60_000L
+private const val WAKE_LOCK_RENEW_MS = 15_000L

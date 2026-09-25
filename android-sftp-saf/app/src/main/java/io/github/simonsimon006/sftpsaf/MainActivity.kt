@@ -82,11 +82,19 @@ class MainActivity : Activity() {
             contentResolver.openInputStream(uri).use { input ->
                 target.outputStream().use { output -> input!!.copyTo(output) }
             }
+            // A private key nobody uses should not linger in app storage.
+            keyFile?.delete()
             keyFile = target
             pickKey.text = "Private key loaded"
         } catch (e: Exception) {
             toast("Could not read the key: ${e.message}")
         }
+    }
+
+    override fun onDestroy() {
+        // Only set while a picked key has not been saved with a server.
+        keyFile?.delete()
+        super.onDestroy()
     }
 
     private fun addServer() {
@@ -100,7 +108,7 @@ class MainActivity : Activity() {
             password = if (usingKey) null else password.text.toString(),
             keyFile = if (usingKey) keyFile?.absolutePath else null,
             keyPassphrase = if (usingKey) passphrase.text.toString() else null,
-            root = root.text.toString().trim().ifEmpty { "/" },
+            root = root.text.toString().trim(),
             hostKey = "",
         )
         if (draft.host.isEmpty() || draft.user.isEmpty()) {
@@ -112,24 +120,34 @@ class MainActivity : Activity() {
             return
         }
 
+        // Picking another key now would delete the one this attempt is using.
         add.isEnabled = false
+        pickKey.isEnabled = false
         status.text = "Connecting to ${draft.host}..."
         Thread {
             val learned = LearningHostKey()
             val outcome = runCatching {
-                connect(draft, learned).use { client ->
-                    client.newSFTPClient().use { sftp -> sftp.ls(draft.root) }
+                val root = connect(draft, learned).use { client ->
+                    client.newSFTPClient().use { sftp ->
+                        // Store the server's own absolute form of the path, so every
+                        // document id derived from it is spelled one way only.
+                        sftp.canonicalize(relativeToHome(draft.root)).also { sftp.ls(it) }
+                    }
                 }
-                learned.seen ?: error("the server presented no host key")
+                draft.copy(hostKey = learned.seen ?: error("the server presented no host key"), root = root)
             }
             runOnUiThread {
+                // The connect can outlast the screen (back pressed mid-connect);
+                // a dialog on a dead window would crash the app.
+                if (isDestroyed) return@runOnUiThread
                 add.isEnabled = true
+                pickKey.isEnabled = true
                 outcome.fold(
-                    onSuccess = { blob ->
+                    onSuccess = { account ->
                         status.text = ""
-                        confirmHostKey(draft.copy(hostKey = blob))
+                        confirmHostKey(account)
                     },
-                    onFailure = { status.text = "Failed: ${it.message}" },
+                    onFailure = { status.text = "Failed: ${it.message ?: it.javaClass.simpleName}" },
                 )
             }
         }.start()
@@ -143,7 +161,7 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this)
             .setTitle("Trust this host key?")
             .setMessage(
-                "${account.host}:${account.port}\n\n${fingerprintOf(account.hostKey)}\n\n" +
+                "${account.host}:${account.port}\nFolder: ${account.root}\n\n${fingerprintOf(account.hostKey)}\n\n" +
                     "Compare it with `ssh-keyscan -p ${account.port} ${account.host} | ssh-keygen -lf -` " +
                     "on a machine you trust. It is pinned from now on.",
             )
@@ -189,6 +207,16 @@ class MainActivity : Activity() {
             )
             accounts.addView(row)
         }
+    }
+
+    /**
+     * SFTP resolves relative paths against the login directory but does not
+     * expand "~", so turn the shell spelling into the relative one.
+     */
+    private fun relativeToHome(path: String): String = when {
+        path.isEmpty() || path == "~" -> "."
+        path.startsWith("~/") -> path.removePrefix("~/").ifEmpty { "." }
+        else -> path
     }
 
     private fun toast(message: String) =
